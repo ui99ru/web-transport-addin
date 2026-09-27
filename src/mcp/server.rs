@@ -41,6 +41,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
 use tower::{Layer, Service};
 
+use super::auth::{BearerAuthLayer, BearerToken};
 use super::registry::{Registry, ResolveResourceError, ResolvedResource, ToolEntry};
 
 type ProgressResetMap = Arc<Mutex<HashMap<String, HashMap<String, mpsc::Sender<()>>>>>;
@@ -203,6 +204,7 @@ pub(super) fn start_mcp_server(
     server_info: Arc<RwLock<McpServerInfo>>,
     subscriptions: Arc<Mutex<HashMap<String, Vec<ClientSink>>>>,
     tasks: Arc<Mutex<HashMap<String, TaskEntry>>>,
+    auth_token: Option<BearerToken>,
 ) -> Result<McpServerState, Box<dyn Error>> {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
@@ -233,6 +235,7 @@ pub(super) fn start_mcp_server(
         service_config,
     );
 
+    let service = BearerAuthLayer { token: auth_token }.layer(service);
     let service = AllowListLayer { allow_list }.layer(service);
 
     let app = Router::new()
@@ -271,6 +274,7 @@ fn start_mcp_server_with_listener(
     subscriptions: Arc<Mutex<HashMap<String, Vec<ClientSink>>>>,
     tasks: Arc<Mutex<HashMap<String, TaskEntry>>>,
     progress_resets: ProgressResetMap,
+    auth_token: Option<BearerToken>,
 ) -> Result<McpServerState, Box<dyn Error>> {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
@@ -302,6 +306,7 @@ fn start_mcp_server_with_listener(
         },
     );
 
+    let service = BearerAuthLayer { token: auth_token }.layer(service);
     let service = AllowListLayer { allow_list }.layer(service);
 
     let app = Router::new()
@@ -365,9 +370,9 @@ struct AllowListService<S> {
     allow_list: Arc<RwLock<AllowList>>,
 }
 
-type BoxResponse = Response<BoxBody<Bytes, Infallible>>;
+pub(super) type BoxResponse = Response<BoxBody<Bytes, Infallible>>;
 
-type BoxFutureResponse = BoxFuture<'static, Result<BoxResponse, Infallible>>;
+pub(super) type BoxFutureResponse = BoxFuture<'static, Result<BoxResponse, Infallible>>;
 
 impl<S, B> Service<Request<B>> for AllowListService<S>
 where
@@ -684,7 +689,9 @@ impl McpBridgeHandler {
         reset_rx: Option<mpsc::Receiver<()>>,
     ) -> Result<McpResponse, McpError> {
         let Some(mut reset_rx) = reset_rx else {
-            return self.wait_for_response_without_progress(request_id, rx).await;
+            return self
+                .wait_for_response_without_progress(request_id, rx)
+                .await;
         };
         let mut rx = rx;
         loop {
@@ -1539,6 +1546,20 @@ mod tests {
         registry: Registry,
         allow_list: AllowList,
     ) -> (String, McpServerState) {
+        start_test_server_with_options(registry, allow_list, None).await
+    }
+
+    async fn start_test_server_with_auth(token: &str) -> (String, McpServerState) {
+        let token = BearerToken::new(token).unwrap();
+        start_test_server_with_options(Registry::default(), AllowList::default_local(), Some(token))
+            .await
+    }
+
+    async fn start_test_server_with_options(
+        registry: Registry,
+        allow_list: AllowList,
+        auth_token: Option<BearerToken>,
+    ) -> (String, McpServerState) {
         // Bind with port 0 to get a free port, keep the listener open to avoid races.
         let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = std_listener.local_addr().unwrap().port();
@@ -1574,6 +1595,7 @@ mod tests {
                 Arc::new(Mutex::new(HashMap::new())),
                 tasks,
                 Arc::new(Mutex::new(HashMap::new())),
+                auth_token,
             )
             .unwrap();
             let _ = state_tx.send(state);
@@ -2060,6 +2082,122 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 204);
+        assert!(resp.headers().contains_key("access-control-allow-origin"));
+    }
+
+    // ── bearer auth ──────────────────────────────────────────────────────────
+
+    const TEST_TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+    fn initialize_body() -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": { "name": "test-client", "version": "1.0.0" }
+            }
+        })
+    }
+
+    async fn post_initialize(base: &str, authorization: Option<&str>) -> reqwest::Response {
+        let mut request = reqwest::Client::new()
+            .post(format!("{base}/mcp"))
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+            .json(&initialize_body());
+        if let Some(value) = authorization {
+            request = request.header("authorization", value);
+        }
+        request.send().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn auth_rejects_missing_or_wrong_token() {
+        let (base, _state) = start_test_server_with_auth(TEST_TOKEN).await;
+
+        let resp = post_initialize(&base, None).await;
+        assert_eq!(resp.status(), 401);
+        assert_eq!(
+            resp.headers()
+                .get("www-authenticate")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer")
+        );
+
+        let resp = post_initialize(&base, Some("Bearer wrong-token-wrong-token-wrong-token")).await;
+        assert_eq!(resp.status(), 401);
+
+        let resp = post_initialize(&base, Some(&format!("Basic {TEST_TOKEN}"))).await;
+        assert_eq!(resp.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn auth_accepts_valid_token() {
+        let (base, _state) = start_test_server_with_auth(TEST_TOKEN).await;
+        let resp = post_initialize(&base, Some(&format!("Bearer {TEST_TOKEN}"))).await;
+        assert_eq!(resp.status(), 200);
+        assert!(resp.headers().contains_key("mcp-session-id"));
+    }
+
+    #[tokio::test]
+    async fn auth_applies_to_session_requests() {
+        let (base, _state) = start_test_server_with_auth(TEST_TOKEN).await;
+        let resp = post_initialize(&base, Some(&format!("Bearer {TEST_TOKEN}"))).await;
+        let session_id = resp
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|value| value.to_str().ok())
+            .unwrap()
+            .to_owned();
+
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/mcp"))
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+            .header("mcp-session-id", session_id)
+            .json(&serde_json::json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn auth_keeps_origin_check_and_preflight() {
+        let (base, _state) = start_test_server_with_auth(TEST_TOKEN).await;
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .post(format!("{base}/mcp"))
+            .header("origin", "http://evil.com")
+            .header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .header("content-type", "application/json")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403);
+
+        let resp = client
+            .request(reqwest::Method::OPTIONS, format!("{base}/mcp"))
+            .header("origin", "http://localhost")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 204);
+
+        let resp = client
+            .post(format!("{base}/mcp"))
+            .header("origin", "http://localhost")
+            .header("content-type", "application/json")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
         assert!(resp.headers().contains_key("access-control-allow-origin"));
     }
 

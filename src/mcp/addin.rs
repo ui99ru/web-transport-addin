@@ -10,6 +10,7 @@ use serde_json::Value;
 use tokio::runtime::Runtime;
 use tokio::sync::{oneshot, Mutex};
 
+use super::auth::resolve_token;
 use super::registry::Registry;
 use super::server::{
     parse_allow_list, start_mcp_server, AllowList, McpResponse, McpServerInfo, McpServerState,
@@ -65,6 +66,8 @@ impl McpAddIn {
             .parse()
             .map_err(|err| format!("Некорректный адрес: {err}"))?;
 
+        let auth_token = resolve_token()?;
+
         let origins = origins.get_string()?;
         let allow_list = parse_allow_list(origins.as_str())?;
         {
@@ -97,6 +100,7 @@ impl McpAddIn {
             self.server_info.clone(),
             self.subscriptions.clone(),
             self.tasks.clone(),
+            auth_token,
         )?;
 
         self.server = Some(server);
