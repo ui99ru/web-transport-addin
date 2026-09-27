@@ -1,6 +1,5 @@
 /target
 /out
-Cargo.lock
 *.log
 .env
 .codex/*
